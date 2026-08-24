@@ -1,4 +1,6 @@
 import os
+import hashlib
+
 import gradio as gr
 
 from ingestion.pdf_reader import extract_text
@@ -9,32 +11,135 @@ from reasoning.reason import reason
 from config.queries import SYSTEM_PROMPTS
 
 
-CURRENT_DOCUMENT_ID = None
+# =========================================================
+# CURRENT DOCUMENT STATE
+# =========================================================
 
+CURRENT_DOCUMENT_ID = None
+CURRENT_DOCUMENT_NAME = None
+
+
+# =========================================================
+# DOCUMENT ID
+# =========================================================
+
+def create_document_id(file_path):
+    """
+    Create a unique and safe document ID.
+
+    The filename alone is not enough because two different
+    documents can have the same filename.
+
+    We combine:
+        - filename
+        - file size
+        - file modification time
+
+    and generate a short SHA256 hash.
+    """
+
+    filename = os.path.basename(file_path)
+
+    file_size = os.path.getsize(file_path)
+
+    modified_time = os.path.getmtime(file_path)
+
+    identifier = (
+        f"{filename}|"
+        f"{file_size}|"
+        f"{modified_time}"
+    )
+
+    file_hash = hashlib.sha256(
+        identifier.encode("utf-8")
+    ).hexdigest()[:12]
+
+    base_name = os.path.splitext(
+        filename
+    )[0].lower()
+
+    # Make filename safe for ChromaDB
+    safe_name = "".join(
+        character if character.isalnum() else "_"
+        for character in base_name
+    )
+
+    safe_name = safe_name.strip("_")
+
+    if not safe_name:
+        safe_name = "document"
+
+    return f"{safe_name}_{file_hash}"
+
+
+# =========================================================
+# PROCESS DOCUMENT
+# =========================================================
 
 def process_document(file_path):
     """
     Process either a PDF or TXT document.
+
+    Pipeline:
+
+        File
+          ↓
+        Text extraction
+          ↓
+        Chunking
+          ↓
+        Embeddings
+          ↓
+        ChromaDB
+          ↓
+        Ready for questions
     """
 
     global CURRENT_DOCUMENT_ID
+    global CURRENT_DOCUMENT_NAME
 
     if not file_path:
-        return "Please upload a PDF or TXT document."
+        return (
+            "Please upload a PDF or TXT document.",
+            "No document loaded."
+        )
 
     try:
+
         # -------------------------------------------------
-        # 1. Extract text
+        # 1. Validate file
         # -------------------------------------------------
 
+        if not os.path.exists(file_path):
+            return (
+                "The selected file could not be found.",
+                "No document loaded."
+            )
+
         filename = os.path.basename(file_path)
-        extension = os.path.splitext(filename)[1].lower()
+
+        extension = os.path.splitext(
+            filename
+        )[1].lower()
+
+        if extension not in [".pdf", ".txt"]:
+            return (
+                "Unsupported file type. "
+                "Please upload a PDF or TXT document.",
+                "No document loaded."
+            )
+
+        # -------------------------------------------------
+        # 2. Extract text
+        # -------------------------------------------------
 
         if extension == ".pdf":
 
-            pages = extract_text(file_path)
+            pages = extract_text(
+                file_path
+            )
 
-        elif extension == ".txt":
+        else:
 
             with open(
                 file_path,
@@ -45,9 +150,12 @@ def process_document(file_path):
                 text = file.read().strip()
 
             if not text:
-                return "The TXT document is empty."
+                return (
+                    "The TXT document is empty.",
+                    "No document loaded."
+                )
 
-            # Treat the TXT document as one page
+            # Treat TXT as one page
             pages = [
                 {
                     "page_number": 1,
@@ -55,15 +163,29 @@ def process_document(file_path):
                 }
             ]
 
-        else:
-
-            return "Unsupported file type. Please upload a PDF or TXT document."
-
         if not pages:
-            return "No text could be extracted from the document."
+            return (
+                "No text could be extracted from the document.",
+                "No document loaded."
+            )
 
         # -------------------------------------------------
-        # 2. Create chunks
+        # 3. Check that text exists
+        # -------------------------------------------------
+
+        total_text = "\n".join(
+            page.get("text", "")
+            for page in pages
+        ).strip()
+
+        if not total_text:
+            return (
+                "The document contains no readable text.",
+                "No document loaded."
+            )
+
+        # -------------------------------------------------
+        # 4. Create chunks
         # -------------------------------------------------
 
         chunks = chunk_text(
@@ -72,28 +194,35 @@ def process_document(file_path):
         )
 
         if not chunks:
-            return "No chunks could be created from the document."
+            return (
+                "No chunks could be created from the document.",
+                "No document loaded."
+            )
 
         # -------------------------------------------------
-        # 3. Create embeddings
+        # 5. Create embeddings
         # -------------------------------------------------
 
-        embeddings = embed_chunks(chunks)
+        embeddings = embed_chunks(
+            chunks
+        )
+
+        if not embeddings:
+            return (
+                "No embeddings could be generated.",
+                "No document loaded."
+            )
 
         # -------------------------------------------------
-        # 4. Create document ID
+        # 6. Create UNIQUE document ID
         # -------------------------------------------------
 
-        document_id = os.path.splitext(filename)[0].lower()
-
-        document_id = (
-            document_id
-            .replace(" ", "_")
-            .replace("-", "_")
+        document_id = create_document_id(
+            file_path
         )
 
         # -------------------------------------------------
-        # 5. Store chunks and embeddings
+        # 7. Store chunks + embeddings
         # -------------------------------------------------
 
         store_chunks(
@@ -102,30 +231,105 @@ def process_document(file_path):
             embeddings=embeddings
         )
 
+        # -------------------------------------------------
+        # 8. Update current document
+        # -------------------------------------------------
+
         CURRENT_DOCUMENT_ID = document_id
+        CURRENT_DOCUMENT_NAME = filename
 
         # -------------------------------------------------
-        # 6. Return processing status
+        # 9. Processing status
         # -------------------------------------------------
 
-        return (
-            f"Document processed successfully.\n\n"
+        document_type = (
+            extension
+            .replace(".", "")
+            .upper()
+        )
+
+        status = (
+            "DOCUMENT PROCESSED SUCCESSFULLY\n\n"
+
             f"File: {filename}\n"
-            f"Type: {extension.upper().replace('.', '')}\n"
+            f"Type: {document_type}\n"
             f"Pages: {len(pages)}\n"
             f"Chunks: {len(chunks)}\n"
-            f"Embeddings: {len(embeddings)}"
+            f"Embeddings: {len(embeddings)}\n\n"
+
+            f"Document ID: {document_id}\n\n"
+
+            "Status: READY"
+        )
+
+        current_status = (
+            f"Current document:\n"
+            f"{filename}\n\n"
+            "Ready for questions."
+        )
+
+        return (
+            status,
+            current_status
         )
 
     except Exception as e:
 
-        return f"Error processing document: {e}"
+        return (
+            f"ERROR PROCESSING DOCUMENT\n\n{str(e)}",
+            "Document was not loaded."
+        )
 
+
+# =========================================================
+# CLEAR CURRENT DOCUMENT
+# =========================================================
+
+def clear_document():
+    """
+    Clear the active document from application state.
+
+    This does NOT delete the document from ChromaDB.
+
+    It only prevents DocuSense from using the previous
+    document for new questions.
+    """
+
+    global CURRENT_DOCUMENT_ID
+    global CURRENT_DOCUMENT_NAME
+
+    CURRENT_DOCUMENT_ID = None
+    CURRENT_DOCUMENT_NAME = None
+
+    return (
+        "CURRENT DOCUMENT CLEARED\n\n"
+        "The stored document data remains in ChromaDB, "
+        "but it is no longer active.",
+
+        "No document loaded.",
+
+        "",   # normal question
+        "",   # answer
+        "",   # sources
+        "",   # conflict question
+        ""    # conflict report
+    )
+
+
+# =========================================================
+# RETRIEVE RELEVANT INFORMATION
+# =========================================================
 
 def get_relevant_information(question):
     """
     Retrieve the most relevant document chunks
     and their metadata.
+
+    Day 7 performance optimization:
+    retrieve 5 chunks instead of 10.
+
+    This reduces the amount of context sent to
+    the reasoning model and can improve response time.
     """
 
     if not CURRENT_DOCUMENT_ID:
@@ -134,7 +338,7 @@ def get_relevant_information(question):
     results = query_chunks(
         document_id=CURRENT_DOCUMENT_ID,
         question=question,
-        k=10
+        k=5
     )
 
     documents = results.get(
@@ -147,8 +351,15 @@ def get_relevant_information(question):
         [[]]
     )[0]
 
-    return documents, metadatas
+    return (
+        documents,
+        metadatas
+    )
 
+
+# =========================================================
+# SOURCE PAGE HELPERS
+# =========================================================
 
 def get_source_pages(metadatas):
     """
@@ -167,9 +378,13 @@ def get_source_pages(metadatas):
             page_number is not None
             and page_number not in source_pages
         ):
-            source_pages.append(page_number)
+            source_pages.append(
+                page_number
+            )
 
-    return sorted(source_pages)
+    return sorted(
+        source_pages
+    )
 
 
 def format_sources(metadatas):
@@ -187,12 +402,17 @@ def format_sources(metadatas):
     source_text = "Sources:\n"
 
     for page_number in source_pages:
+
         source_text += (
             f"- Page {page_number}\n"
         )
 
     return source_text
 
+
+# =========================================================
+# ASK DOCUSENSE
+# =========================================================
 
 def ask_docusense(question):
     """
@@ -216,9 +436,14 @@ def ask_docusense(question):
 
     try:
 
+        # -------------------------------------------------
         # Retrieve relevant chunks
-        documents, metadatas = get_relevant_information(
-            question
+        # -------------------------------------------------
+
+        documents, metadatas = (
+            get_relevant_information(
+                question
+            )
         )
 
         if not documents:
@@ -228,14 +453,20 @@ def ask_docusense(question):
                 ""
             )
 
-        # Ask reasoning model
+        # -------------------------------------------------
+        # Generate answer
+        # -------------------------------------------------
+
         answer = reason(
             question=question,
             context_chunks=documents,
             system_prompt=SYSTEM_PROMPTS["rfq"]
         )
 
+        # -------------------------------------------------
         # Format sources
+        # -------------------------------------------------
+
         source_text = format_sources(
             metadatas
         )
@@ -248,20 +479,27 @@ def ask_docusense(question):
     except Exception as e:
 
         return (
-            f"Error answering question: {e}",
+            f"ERROR ANSWERING QUESTION\n\n{str(e)}",
             ""
         )
 
+
+# =========================================================
+# CONFLICT DETECTION
+# =========================================================
 
 def check_conflicts(question):
     """
     Analyze retrieved document excerpts for
     contradictory information.
+
+    The conflict detector now has its own question
+    field in Section 3.
     """
 
     if not question.strip():
 
-        return "Please enter a question."
+        return "Please enter a conflict question."
 
     if not CURRENT_DOCUMENT_ID:
 
@@ -271,9 +509,14 @@ def check_conflicts(question):
 
     try:
 
+        # -------------------------------------------------
         # Retrieve relevant information
-        documents, metadatas = get_relevant_information(
-            question
+        # -------------------------------------------------
+
+        documents, metadatas = (
+            get_relevant_information(
+                question
+            )
         )
 
         if not documents:
@@ -291,9 +534,23 @@ def check_conflicts(question):
 
             "Analyze ONLY the provided document excerpts.\n\n"
 
+            "The user's question identifies the topic that "
+            "should be checked for contradictions.\n\n"
+
             "Determine whether the excerpts contain "
             "conflicting information relevant to the "
             "user's question.\n\n"
+
+            "IMPORTANT:\n"
+            "Do not assume that two statements are "
+            "conflicting simply because they discuss the "
+            "same topic.\n\n"
+
+            "Only report a conflict when the document "
+            "contains materially different requirements, "
+            "dates, values, durations, conditions, or "
+            "other information that cannot both be true "
+            "in the same context.\n\n"
 
             "If there is no conflict, respond exactly:\n"
             "NO CONFLICT DETECTED\n\n"
@@ -320,20 +577,27 @@ def check_conflicts(question):
             "document excerpts."
         )
 
+        # -------------------------------------------------
         # Ask reasoning model
+        # -------------------------------------------------
+
         conflict_result = reason(
             question=question,
             context_chunks=documents,
             system_prompt=conflict_prompt
         )
 
-        # Add sources
+        # -------------------------------------------------
+        # Add source pages
+        # -------------------------------------------------
+
         source_text = format_sources(
             metadatas
         )
 
         conflict_result += (
-            "\n\n" + source_text
+            "\n\n"
+            + source_text
         )
 
         return conflict_result
@@ -341,7 +605,7 @@ def check_conflicts(question):
     except Exception as e:
 
         return (
-            f"Error checking conflicts: {e}"
+            f"ERROR CHECKING CONFLICTS\n\n{str(e)}"
         )
 
 
@@ -353,9 +617,9 @@ with gr.Blocks(
     title="DocuSense"
 ) as app:
 
-    # -----------------------------------------------------
+    # =====================================================
     # HEADER
-    # -----------------------------------------------------
+    # =====================================================
 
     gr.Markdown(
         """
@@ -368,9 +632,9 @@ with gr.Blocks(
         """
     )
 
-    # -----------------------------------------------------
-    # DOCUMENT UPLOAD
-    # -----------------------------------------------------
+    # =====================================================
+    # 1. UPLOAD DOCUMENT
+    # =====================================================
 
     gr.Markdown(
         "## 1. Upload Document"
@@ -389,20 +653,24 @@ with gr.Blocks(
         "Process Document"
     )
 
+    clear_button = gr.Button(
+        "Clear Current Document"
+    )
+
     document_status = gr.Textbox(
         label="Document Status",
-        lines=6
+        lines=10
     )
 
-    process_button.click(
-        fn=process_document,
-        inputs=document_file,
-        outputs=document_status
+    current_document = gr.Textbox(
+        label="Current Document",
+        value="No document loaded.",
+        lines=3
     )
 
-    # -----------------------------------------------------
-    # QUESTION ANSWERING
-    # -----------------------------------------------------
+    # =====================================================
+    # 2. QUESTION ANSWERING
+    # =====================================================
 
     gr.Markdown(
         "## 2. Ask a Question"
@@ -410,7 +678,8 @@ with gr.Blocks(
 
     question = gr.Textbox(
         label="Question",
-        placeholder="What is the submission deadline?"
+        placeholder="What is the submission deadline?",
+        lines=2
     )
 
     ask_button = gr.Button(
@@ -427,21 +696,21 @@ with gr.Blocks(
         lines=5
     )
 
-    ask_button.click(
-        fn=ask_docusense,
-        inputs=question,
-        outputs=[
-            answer,
-            sources
-        ]
-    )
-
-    # -----------------------------------------------------
-    # CONFLICT DETECTION
-    # -----------------------------------------------------
+    # =====================================================
+    # 3. CONFLICT DETECTION
+    # =====================================================
 
     gr.Markdown(
         "## 3. Conflict Detection"
+    )
+
+    conflict_question = gr.Textbox(
+        label="Conflict Question",
+        placeholder=(
+            "Example: Are there conflicting contract durations "
+            "in the document?"
+        ),
+        lines=2
     )
 
     conflict_button = gr.Button(
@@ -453,10 +722,53 @@ with gr.Blocks(
         lines=14
     )
 
+    # =====================================================
+    # EVENT HANDLERS
+    # =====================================================
+
+    # Process document
+    process_button.click(
+        fn=process_document,
+        inputs=document_file,
+        outputs=[
+            document_status,
+            current_document
+        ]
+    )
+
+    # Ask normal question
+    ask_button.click(
+        fn=ask_docusense,
+        inputs=question,
+        outputs=[
+            answer,
+            sources
+        ]
+    )
+
+    # Check conflicts using dedicated conflict question
     conflict_button.click(
         fn=check_conflicts,
-        inputs=question,
+        inputs=conflict_question,
         outputs=conflict_report
+    )
+
+    # =====================================================
+    # CLEAR DOCUMENT
+    # =====================================================
+
+    clear_button.click(
+        fn=clear_document,
+        inputs=[],
+        outputs=[
+            document_status,
+            current_document,
+            question,
+            answer,
+            sources,
+            conflict_question,
+            conflict_report
+        ]
     )
 
 
